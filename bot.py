@@ -6,7 +6,7 @@ import logging
 import asyncio
 import subprocess
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
 # Load environment variables
@@ -56,13 +56,19 @@ async def update_cmd(client: Client, message: Message):
 
     try:
         git_output = subprocess.check_output(["git", "pull"], stderr=subprocess.STDOUT, text=True)
-        await status_msg.edit_text(f"```\n{git_output}\n```\nRestarting bot process...", parse_mode="markdown")
+        await status_msg.edit_text(
+            f"```\n{git_output}\n```\nRestarting bot process...",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
 
         # Restart Python process
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     except subprocess.CalledProcessError as e:
-        await status_msg.edit_text(f"❌ Git Update Failed:\n```\n{e.output}\n```", parse_mode="markdown")
+        await status_msg.edit_text(
+            f"❌ Git Update Failed:\n```\n{e.output}\n```",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed to restart bot: {str(e)}")
 
@@ -117,12 +123,12 @@ async def process_apk(client: Client, message: Message):
         else:
             response_text = "⚠️ No obvious plaintext API keys found in decompiled code."
 
-        await status_msg.edit_text(response_text, parse_mode="markdown")
+        await status_msg.edit_text(response_text, parse_mode=enums.ParseMode.MARKDOWN)
 
     except Exception as e:
         await status_msg.edit_text(f"❌ Processing error: {str(e)}")
     finally:
-        # Clean up files from server disk
+        # Clean up temporary files
         if os.path.exists(apk_path):
             os.remove(apk_path)
         if os.path.exists(output_dir):
