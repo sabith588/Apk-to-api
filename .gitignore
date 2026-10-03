@@ -1,0 +1,6 @@
+.env
+*.apk
+decompiled_*
+__pycache__/
+*.session
+*.session-journal
