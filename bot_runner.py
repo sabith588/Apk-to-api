@@ -1,3 +1,4 @@
+
 import os
 import re
 import sys
@@ -54,6 +55,7 @@ def parse_show_details(raw_text: str) -> tuple[str, str]:
     show_name = ""
     ep_num = ""
 
+    # Parse 'dt' parameter from Google Analytics URL
     dt_match = re.search(r'[?&]dt=([^&]+)', raw_text)
     if dt_match:
         dt_val = unquote(dt_match.group(1))
@@ -81,12 +83,15 @@ def parse_show_details(raw_text: str) -> tuple[str, str]:
         ep_num = "ep"
 
     clean_show = re.sub(r'[^a-zA-Z0-9\s]', '', show_name).strip()
-    slug = f"{re.sub(r'\s+', '-', clean_show).lower()}-{ep_num}"
+    
+    # FIXED: Replaced backslash expression outside f-string to prevent deployment SyntaxError
+    formatted_show = re.sub(r'\s+', '-', clean_show).lower()
+    slug = f"{formatted_show}-{ep_num}"
     display_name = f"{clean_show.title()} {ep_num.upper()}"
 
     return display_name, slug
 
-# ==================== ADMIN PANEL & BUTTON HANDLERS ====================
+# ==================== ADMIN CONTROL PANEL ====================
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -96,6 +101,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("🔄 Update & Restart Code", callback_data="update_code"),
             InlineKeyboardButton("ℹ️ Check Status", callback_data="check_status")
+        ],
+        [
+            InlineKeyboardButton("🧹 Clear Temp Cache", callback_data="clear_cache")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -114,27 +122,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "update_code":
-        await query.edit_message_text("🔄 **Updating Code & Restarting Bot...**\nPlease wait a few seconds.")
-        
-        # Git pull if running inside a Git repository
+        await query.edit_message_text("🔄 **Updating Code & Restarting...**\nPlease wait a few seconds.")
         try:
             subprocess.run(["git", "pull"], check=True)
         except Exception:
-            pass  # Fall back to restart if git is not used
-
-        # Restart Python process dynamically
+            pass
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     elif query.data == "check_status":
         queue_size = download_queue.qsize()
         await query.edit_message_text(
-            f"📊 **Bot Status Summary**\n\n"
+            f"📊 **Bot Operational Status**\n\n"
             f"🔹 **Active Queue:** `{queue_size}` task(s)\n"
-            f"🔹 **Log Channel:** `{LOG_CHANNEL_ID}`\n"
-            f"🔹 **Status:** Running smoothly 🚀"
+            f"🔹 **Target Log Channel:** `{LOG_CHANNEL_ID}`\n"
+            f"🔹 **Engine:** Multi-threaded FFmpeg Direct Copy"
         )
 
-# ==================== DOWNLOAD WORKER ====================
+    elif query.data == "clear_cache":
+        count = 0
+        for f in os.listdir("/tmp"):
+            if f.endswith((".m4a", ".mp4", ".jpg", ".png", ".webp")):
+                os.remove(os.path.join("/tmp", f))
+                count += 1
+        await query.edit_message_text(f"🧹 **Cache Cleared:** Removed {count} temporary file(s).")
+
+# ==================== DOWNLOAD QUEUE WORKER ====================
 
 async def process_queue_worker(app: Application):
     while True:
@@ -143,7 +155,7 @@ async def process_queue_worker(app: Application):
         try:
             await execute_download(url, update, app)
         except Exception as e:
-            logging.error(f"Queue Error: {e}")
+            logging.error(f"Execution Error: {e}")
         finally:
             download_queue.task_done()
 
@@ -151,10 +163,13 @@ async def execute_download(url: str, update: Update, app: Application):
     stream_url = extract_stream_url(url)
     display_title, file_slug = parse_show_details(url)
     clean_url = stream_url.split('?')[0].lower()
+    remaining = download_queue.qsize()
 
-    status_msg = await update.message.reply_text(f"⚡ **Fast Extracting:** `{display_title}`...")
+    status_msg = await update.message.reply_text(
+        f"⚡ **Fast Extracting:** `{display_title}`\n⏳ Queue remaining: `{remaining}` item(s)..."
+    )
 
-    # PHOTO / IMAGE
+    # 1. PHOTO/IMAGE HANDLING
     if any(clean_url.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
@@ -169,13 +184,13 @@ async def execute_download(url: str, update: Update, app: Application):
                             photo=photo,
                             caption=f"🖼 **{display_title}**\n\n🔗 `{stream_url}`"
                         )
-                    await status_msg.edit_text(f"🚀 **{display_title}** uploaded!")
-                    os.remove(img_path)
+                    await status_msg.edit_text(f"🚀 **{display_title}** uploaded to Log Channel!")
+                    if os.path.exists(img_path): os.remove(img_path)
         except Exception as e:
-            await status_msg.edit_text(f"❌ Error: {str(e)}")
+            await status_msg.edit_text(f"❌ Error downloading image: {str(e)}")
         return
 
-    # AUDIO HLS STREAM
+    # 2. AUDIO HLS STREAM (Zero-Encoding Fast Copy)
     output_file = f"/tmp/{file_slug}.m4a"
     if os.path.exists(output_file): os.remove(output_file)
 
@@ -211,20 +226,20 @@ async def execute_download(url: str, update: Update, app: Application):
                     filename=f"{file_slug}.m4a",
                     title=display_title,
                     performer="Pocket FM Bot",
-                    caption=f"🎉 **{display_title}**\n📁 File: `{file_slug}.m4a`\n🔗 Stream: `{stream_url}`"
+                    caption=f"🎉 **{display_title}**\n📁 **File:** `{file_slug}.m4a`\n🔗 **Stream:** `{stream_url}`"
                 )
-            await status_msg.edit_text(f"🚀 **{display_title}** successfully auto-sorted!")
-            os.remove(output_file)
+            await status_msg.edit_text(f"🚀 **{display_title}** successfully auto-sorted and uploaded!")
+            if os.path.exists(output_file): os.remove(output_file)
         else:
-            err_log = stderr.decode()[-200:] if stderr else "Empty file"
+            err_log = stderr.decode()[-200:] if stderr else "Empty output file"
             await status_msg.edit_text(f"❌ **FFmpeg Error:** `{err_log}`")
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        await status_msg.edit_text(f"❌ Execution Error: {str(e)}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("⚡ **Automated Speed Downloader Active!**\nUse /admin to open the Admin Panel.")
+    await update.message.reply_text("⚡ **Automated Downloader Active!**\nUse /admin to open control panel.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -235,14 +250,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if urls:
             for url in urls:
                 await download_queue.put((url, update))
-            await update.message.reply_text(f"📥 Added {len(urls)} episode(s) to the queue!")
+            await update.message.reply_text(f"📥 Added {len(urls)} item(s) to the processing queue!")
 
 def main():
     threading.Thread(target=start_dummy_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -251,7 +265,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(process_queue_worker(app))
 
-    print("🤖 Automated High-Speed Downloader Bot active...")
+    print("🤖 High-Speed Media Downloader Bot Active...")
     app.run_polling()
 
 if __name__ == "__main__":
