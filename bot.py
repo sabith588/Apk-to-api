@@ -1,4 +1,5 @@
 import re
+import io
 import logging
 import asyncio
 import subprocess
@@ -72,8 +73,14 @@ def extract_show_id(text: str) -> str:
     return match.group(1) if match else text.strip()
 
 
-async def automate_phone_login(phone_number: str, user_data: dict) -> bool:
-    """Navigates to pocketfm.com/login, clicks 'CONTINUE WITH PHONE', fills the phone number, and clicks 'SEND OTP'."""
+async def automate_phone_login(phone_number: str, user_data: dict) -> tuple[bool, bytes | None]:
+    """
+    Navigates to pocketfm.com/login, clicks 'CONTINUE WITH PHONE', fills the phone number, and clicks 'SEND OTP'.
+    Returns (success_status, error_screenshot_bytes).
+    """
+    pw = None
+    browser = None
+    page = None
     try:
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
@@ -89,7 +96,7 @@ async def automate_phone_login(phone_number: str, user_data: dict) -> bool:
         await page.goto("https://pocketfm.com/login", wait_until="domcontentloaded", timeout=30000)
 
         # Step 1: Click 'CONTINUE WITH PHONE'
-        phone_btn = page.locator("text='CONTINUE WITH PHONE'")[span_0](start_span)[span_0](end_span)
+        phone_btn = page.locator("text='CONTINUE WITH PHONE'")
         await phone_btn.click()
         await page.wait_for_timeout(1000)
 
@@ -99,38 +106,46 @@ async def automate_phone_login(phone_number: str, user_data: dict) -> bool:
         await page.wait_for_timeout(500)
 
         # Step 3: Click 'SEND OTP'
-        send_otp_btn = page.locator("text='SEND OTP'")[span_1](start_span)[span_1](end_span)
+        send_otp_btn = page.locator("text='SEND OTP'")
         await send_otp_btn.click()
 
-        # Step 4: Wait for OTP input page/field to load
+        # Step 4: Wait for OTP input field to load
         await page.wait_for_selector("input", timeout=15000)
 
         # Preserve state for Telegram OTP submission
         user_data["pw"] = pw
         user_data["browser"] = browser
         user_data["page"] = page
-        return True
+        return True, None
 
     except Exception as e:
         logger.error(f"Playwright Login Error: {e}")
-        if 'browser' in locals():
+        screenshot_bytes = None
+        if page:
+            try:
+                screenshot_bytes = await page.screenshot(type="png", full_page=True)
+            except Exception as ss_err:
+                logger.error(f"Failed to capture screenshot: {ss_err}")
+
+        if browser:
             await browser.close()
-        if 'pw' in locals():
+        if pw:
             await pw.stop()
-        return False
+
+        return False, screenshot_bytes
 
 
-async def automate_otp_submission(otp_code: str, user_data: dict) -> bool:
-    """Submits OTP on the active page, clicks login, and captures updated session cookies and tokens."""
+async def automate_otp_submission(otp_code: str, user_data: dict) -> tuple[bool, bytes | None]:
+    """Submits OTP on the active page, clicks login, and captures updated session cookies/tokens."""
     global CURRENT_COOKIE, AUTH_TOKEN
+    page = user_data.get("page")
+    browser = user_data.get("browser")
+    pw = user_data.get("pw")
+
+    if not page:
+        return False, None
+
     try:
-        page = user_data.get("page")
-        browser = user_data.get("browser")
-        pw = user_data.get("pw")
-
-        if not page:
-            return False
-
         # Fill OTP digit fields
         otp_inputs = page.locator("input[type='text'], input[type='number'], input[type='tel'], input")
         count = await otp_inputs.count()
@@ -172,11 +187,26 @@ async def automate_otp_submission(otp_code: str, user_data: dict) -> bool:
         user_data.pop("browser", None)
         user_data.pop("page", None)
 
-        return bool(CURRENT_COOKIE or AUTH_TOKEN)
+        return bool(CURRENT_COOKIE or AUTH_TOKEN), None
 
     except Exception as e:
         logger.error(f"OTP Submission Error: {e}")
-        return False
+        screenshot_bytes = None
+        try:
+            screenshot_bytes = await page.screenshot(type="png", full_page=True)
+        except Exception as ss_err:
+            logger.error(f"Failed to capture OTP error screenshot: {ss_err}")
+
+        if browser:
+            await browser.close()
+        if pw:
+            await pw.stop()
+
+        user_data.pop("pw", None)
+        user_data.pop("browser", None)
+        user_data.pop("page", None)
+
+        return False, screenshot_bytes
 
 
 async def fetch_show_episodes(show_id: str) -> list:
@@ -297,10 +327,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Please enter a valid 10-digit mobile number.")
             return
 
-        status_msg = await update.message.reply_text("🌐 Opening browser, navigating to `https://pocketfm.com/login`, clicking 'CONTINUE WITH PHONE', typing number, and requesting OTP...", parse_mode="Markdown")
-        
-        success = await automate_phone_login(phone, context.user_data)
-        
+        status_msg = await update.message.reply_text(
+            "🌐 Opening browser, navigating to `https://pocketfm.com/login`, clicking 'CONTINUE WITH PHONE', typing number, and requesting OTP...",
+            parse_mode="Markdown"
+        )
+
+        success, error_screenshot = await automate_phone_login(phone, context.user_data)
+
         if success:
             context.user_data["state"] = "AWAITING_OTP"
             await status_msg.edit_text(
@@ -311,6 +344,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.user_data["state"] = None
             await status_msg.edit_text("❌ Failed to navigate or request OTP on pocketfm.com. Check logs or try manual cookie entry.")
+            
+            if error_screenshot:
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=io.BytesIO(error_screenshot),
+                    caption="🚨 **Browser Error Screenshot**\nHere is what the browser rendered when the step failed."
+                )
         return
 
     # Step 2: Handle OTP Input
@@ -318,7 +358,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         otp = re.sub(r'\D', '', text)
         status_msg = await update.message.reply_text("⏳ Entering OTP and completing login...", parse_mode="Markdown")
 
-        success = await automate_otp_submission(otp, context.user_data)
+        success, error_screenshot = await automate_otp_submission(otp, context.user_data)
         context.user_data["state"] = None
 
         if success:
@@ -328,7 +368,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         else:
-            await status_msg.edit_text("❌ Login failed. Try again using /start.")
+            await status_msg.edit_text("❌ Login failed during OTP verification. Check screenshot below.")
+            if error_screenshot:
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=io.BytesIO(error_screenshot),
+                    caption="🚨 **OTP Error Screenshot**"
+                )
         return
 
     # Step 3: Handle Manual Cookie Entry
