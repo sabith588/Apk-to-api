@@ -13,6 +13,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from playwright.async_api import async_playwright
 
 # Logging Setup
 logging.basicConfig(
@@ -25,19 +26,27 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8827979888:AAGXJJsYhKHcVEGK-aCgJH0RqQxVtJb8Us8"
 TARGET_CHANNEL_ID = "-1004291729847"
 
-# Global Session State
+# Session Storage
 CURRENT_COOKIE = ""
 AUTH_TOKEN = ""
 
 DOWNLOAD_DIR = Path("./downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Pocket FM Web API Endpoints
-API_BASE = "https://api.pocketfm.com"
+
+def extract_token(text: str) -> str:
+    """Extracts JWT token string from cookies or raw token input."""
+    match = re.search(r'auth-token=([^;]+)', text)
+    if match:
+        return match.group(1).strip()
+    if text.strip().startswith("eyJ"):
+        return text.strip()
+    return ""
 
 
 def get_headers() -> dict:
-    """Generates standard browser headers with active session tokens."""
+    """Builds HTTP headers using active cookies/tokens."""
+    token = extract_token(CURRENT_COOKIE) or AUTH_TOKEN
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -49,72 +58,136 @@ def get_headers() -> dict:
     }
 
     if CURRENT_COOKIE:
-        headers["Cookie"] = CURRENT_COOKIE
-    if AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
-        headers["auth-token"] = AUTH_TOKEN
+        headers["Cookie"] = CURRENT_COOKIE.strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["auth-token"] = token
 
     return headers
 
 
 def extract_show_id(text: str) -> str:
-    """Extracts a 32-to-40-character show_id from a raw ID or Pocket FM URL."""
+    """Extracts show ID from URL or raw input."""
     match = re.search(r'([a-f0-9]{32,40})', text, re.IGNORECASE)
     return match.group(1) if match else text.strip()
 
 
-async def send_otp_request(mobile_number: str) -> dict:
-    """Requests OTP from Pocket FM for the provided mobile number."""
-    url = f"{API_BASE}/v2/user_api/send_otp"
-    payload = {
-        "phone_number": mobile_number,
-        "country_code": "+91",  # Change country code if needed
-        "platform": "web"
-    }
-    
-    async with httpx.AsyncClient(headers=get_headers(), timeout=15.0) as client:
-        try:
-            res = await client.post(url, json=payload)
-            return res.json()
-        except Exception as e:
-            logger.error(f"Error requesting OTP: {e}")
-            return {"status": "error", "message": str(e)}
+async def automate_phone_login(phone_number: str, user_data: dict) -> bool:
+    """Navigates to pocketfm.com/login, clicks 'CONTINUE WITH PHONE', fills the phone number, and clicks 'SEND OTP'."""
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+
+        logger.info("Opening https://pocketfm.com/login")
+        await page.goto("https://pocketfm.com/login", wait_until="domcontentloaded", timeout=30000)
+
+        # Step 1: Click 'CONTINUE WITH PHONE'
+        phone_btn = page.locator("text='CONTINUE WITH PHONE'")[span_0](start_span)[span_0](end_span)
+        await phone_btn.click()
+        await page.wait_for_timeout(1000)
+
+        # Step 2: Type phone number in input field
+        phone_input = page.locator("input[type='tel'], input[type='text'], input")
+        await phone_input.first.fill(phone_number)
+        await page.wait_for_timeout(500)
+
+        # Step 3: Click 'SEND OTP'
+        send_otp_btn = page.locator("text='SEND OTP'")[span_1](start_span)[span_1](end_span)
+        await send_otp_btn.click()
+
+        # Step 4: Wait for OTP input page/field to load
+        await page.wait_for_selector("input", timeout=15000)
+
+        # Preserve state for Telegram OTP submission
+        user_data["pw"] = pw
+        user_data["browser"] = browser
+        user_data["page"] = page
+        return True
+
+    except Exception as e:
+        logger.error(f"Playwright Login Error: {e}")
+        if 'browser' in locals():
+            await browser.close()
+        if 'pw' in locals():
+            await pw.stop()
+        return False
 
 
-async def verify_otp_request(mobile_number: str, otp: str) -> dict:
-    """Verifies OTP with Pocket FM and retrieves a new auth token."""
-    url = f"{API_BASE}/v2/user_api/verify_otp"
-    payload = {
-        "phone_number": mobile_number,
-        "country_code": "+91",
-        "otp": otp,
-        "platform": "web"
-    }
+async def automate_otp_submission(otp_code: str, user_data: dict) -> bool:
+    """Submits OTP on the active page, clicks login, and captures updated session cookies and tokens."""
+    global CURRENT_COOKIE, AUTH_TOKEN
+    try:
+        page = user_data.get("page")
+        browser = user_data.get("browser")
+        pw = user_data.get("pw")
 
-    async with httpx.AsyncClient(headers=get_headers(), timeout=15.0) as client:
-        try:
-            res = await client.post(url, json=payload)
-            data = res.json()
-            
-            # Capture cookies returned in headers
-            cookies = res.cookies
-            cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
-            
-            return {"data": data, "cookie_str": cookie_str}
-        except Exception as e:
-            logger.error(f"Error verifying OTP: {e}")
-            return {"data": {"status": "error"}, "cookie_str": ""}
+        if not page:
+            return False
+
+        # Fill OTP digit fields
+        otp_inputs = page.locator("input[type='text'], input[type='number'], input[type='tel'], input")
+        count = await otp_inputs.count()
+
+        if count == 1:
+            await otp_inputs.first.fill(otp_code)
+        elif count > 1:
+            for idx, char in enumerate(otp_code[:count]):
+                await otp_inputs.nth(idx).fill(char)
+
+        await page.wait_for_timeout(500)
+
+        # Click Login / Verify / Submit button
+        submit_btn = page.locator("button:has-text('VERIFY'), button:has-text('LOGIN'), button:has-text('SUBMIT'), button[type='submit']")
+        if await submit_btn.count() > 0:
+            await submit_btn.first.click()
+
+        await page.wait_for_timeout(5000)
+
+        # Extract Cookies
+        cookies = await page.context.cookies()
+        cookie_pairs = [f"{c['name']}={c['value']}" for c in cookies]
+        CURRENT_COOKIE = "; ".join(cookie_pairs)
+
+        for c in cookies:
+            if c['name'] == 'auth-token':
+                AUTH_TOKEN = c['value']
+
+        if not AUTH_TOKEN:
+            try:
+                AUTH_TOKEN = await page.evaluate("() => localStorage.getItem('auth-token') || sessionStorage.getItem('auth-token')")
+            except Exception:
+                pass
+
+        await browser.close()
+        await pw.stop()
+
+        user_data.pop("pw", None)
+        user_data.pop("browser", None)
+        user_data.pop("page", None)
+
+        return bool(CURRENT_COOKIE or AUTH_TOKEN)
+
+    except Exception as e:
+        logger.error(f"OTP Submission Error: {e}")
+        return False
 
 
 async def fetch_show_episodes(show_id: str) -> list:
-    """Queries Pocket FM API using active authentication headers to retrieve episodes."""
-    url = f"{API_BASE}/v2/content_api/show.get_details?show_id={show_id}&info_level=max"
-    
+    """Queries Pocket FM API using active headers to retrieve episodes."""
+    url = f"https://api.pocketfm.com/v2/content_api/show.get_details?show_id={show_id}&info_level=max"
+
     async with httpx.AsyncClient(headers=get_headers(), timeout=20.0, follow_redirects=True) as client:
         try:
             response = await client.get(url)
             logger.info(f"API Response Code: {response.status_code}")
-            
+
             if response.status_code != 200:
                 logger.error(f"API Failed: {response.text}")
                 return []
@@ -122,9 +195,9 @@ async def fetch_show_episodes(show_id: str) -> list:
             data = response.json()
             result = data.get("result", {}) or data.get("data", {}) or data
             stories = (
-                result.get("stories") or 
-                result.get("episodes") or 
-                result.get("show", {}).get("stories") or 
+                result.get("stories") or
+                result.get("episodes") or
+                result.get("show", {}).get("stories") or
                 []
             )
 
@@ -133,9 +206,9 @@ async def fetch_show_episodes(show_id: str) -> list:
                 ep_id = ep.get("id") or ep.get("story_id") or ep.get("episode_id")
                 title = ep.get("title") or ep.get("name") or f"Episode {ep_id}"
                 stream_url = (
-                    ep.get("media_url") or 
-                    ep.get("stream_url") or 
-                    ep.get("download_url") or 
+                    ep.get("media_url") or
+                    ep.get("stream_url") or
+                    ep.get("download_url") or
                     ep.get("link") or
                     ep.get("audio_url")
                 )
@@ -154,7 +227,7 @@ async def fetch_show_episodes(show_id: str) -> list:
 
 
 async def download_file(url: str, output_path: Path) -> bool:
-    """Downloads audio/video stream passing auth headers to yt-dlp."""
+    """Downloads audio stream passing cookies to yt-dlp."""
     headers = get_headers()
     cmd = [
         "yt-dlp",
@@ -166,9 +239,7 @@ async def download_file(url: str, output_path: Path) -> bool:
     ]
 
     if CURRENT_COOKIE:
-        cmd.extend(["--add-header", f"Cookie: {CURRENT_COOKIE}"])
-    if AUTH_TOKEN:
-        cmd.extend(["--add-header", f"Authorization: Bearer {AUTH_TOKEN}"])
+        cmd.extend(["--add-header", f"Cookie: {CURRENT_COOKIE.strip()}"])
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -176,7 +247,7 @@ async def download_file(url: str, output_path: Path) -> bool:
         stderr=subprocess.PIPE
     )
     _, stderr = await proc.communicate()
-    
+
     if proc.returncode == 0:
         return True
     logger.error(f"yt-dlp error: {stderr.decode()}")
@@ -184,128 +255,100 @@ async def download_file(url: str, output_path: Path) -> bool:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays main menu."""
     keyboard = [
-        [InlineKeyboardButton("📱 Login with Mobile Number", callback_data="btn_login_mobile")],
-        [InlineKeyboardButton("🔑 Manual Cookie / Token Entry", callback_data="btn_set_cookie")]
+        [InlineKeyboardButton("🌐 Automated Web Login", callback_data="btn_web_login")],
+        [InlineKeyboardButton("🔑 Manual Cookie Entry", callback_data="btn_set_cookie")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = (
         "🤖 **Pocket FM Downloader Bot**\n\n"
-        "Send me a **Show ID** or **Pocket FM Link** to download episodes.\n\n"
-        "Click **Login with Mobile Number** below to authenticate directly via OTP."
+        "Send me a **Show ID** or **Pocket FM Link** to fetch episodes.\n\n"
+        "Tap **Automated Web Login** to log into pocketfm.com automatically."
     )
     await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles button interactions."""
     query = update.callback_query
     await query.answer()
 
-    if query.data == "btn_login_mobile":
+    if query.data == "btn_web_login":
         context.user_data["state"] = "AWAITING_PHONE"
         await query.message.reply_text(
-            "📱 **Mobile Login Procedure**\n\n"
-            "Please send your 10-digit mobile number (e.g., `9876543210`).",
+            "📱 **Browser Login Automation**\n\n"
+            "Please reply with your 10-digit phone number (e.g. `9876543210`).",
             parse_mode="Markdown"
         )
-
     elif query.data == "btn_set_cookie":
         context.user_data["state"] = "AWAITING_COOKIE"
-        await query.message.reply_text(
-            "🔑 Send your raw `Cookie` header or `auth-token` string in your next message."
-        )
+        await query.message.reply_text("🔑 Send your raw `Cookie` header or `auth-token` string.")
 
 
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes dynamic text input based on user conversation state."""
-    global CURRENT_COOKIE, AUTH_TOKEN
+    global CURRENT_COOKIE
     text = update.message.text.strip()
     user_state = context.user_data.get("state")
 
-    # 1. Phone Number State
+    # Step 1: Handle Phone Input
     if user_state == "AWAITING_PHONE":
         phone = re.sub(r'\D', '', text)
         if len(phone) < 10:
-            await update.message.reply_text("❌ Invalid mobile number. Please send a valid 10-digit number.")
+            await update.message.reply_text("❌ Please enter a valid 10-digit mobile number.")
             return
 
-        context.user_data["phone"] = phone
-        status_msg = await update.message.reply_text(f"⏳ Requesting OTP for `+91{phone}`...", parse_mode="Markdown")
+        status_msg = await update.message.reply_text("🌐 Opening browser, navigating to `https://pocketfm.com/login`, clicking 'CONTINUE WITH PHONE', typing number, and requesting OTP...", parse_mode="Markdown")
         
-        response = await send_otp_request(phone)
+        success = await automate_phone_login(phone, context.user_data)
         
-        if response.get("status") in [200, "success", True] or response.get("code") == 200:
+        if success:
             context.user_data["state"] = "AWAITING_OTP"
             await status_msg.edit_text(
-                f"📩 **OTP Sent to +91{phone}!**\n\n"
-                "Please reply with the 4-digit or 6-digit OTP code you received via SMS.",
+                "📩 **OTP Sent!**\n\n"
+                "Please reply with the OTP code sent to your mobile device.",
                 parse_mode="Markdown"
             )
         else:
-            err_msg = response.get("message", "Failed to send OTP.")
             context.user_data["state"] = None
-            await status_msg.edit_text(f"❌ **OTP Request Failed:** {err_msg}")
+            await status_msg.edit_text("❌ Failed to navigate or request OTP on pocketfm.com. Check logs or try manual cookie entry.")
         return
 
-    # 2. OTP Verification State
+    # Step 2: Handle OTP Input
     if user_state == "AWAITING_OTP":
         otp = re.sub(r'\D', '', text)
-        phone = context.user_data.get("phone")
+        status_msg = await update.message.reply_text("⏳ Entering OTP and completing login...", parse_mode="Markdown")
 
-        status_msg = await update.message.reply_text("⏳ Verifying OTP with Pocket FM...", parse_mode="Markdown")
-        res_data = await verify_otp_request(phone, otp)
-        
-        data = res_data.get("data", {})
-        cookie_str = res_data.get("cookie_str", "")
+        success = await automate_otp_submission(otp, context.user_data)
+        context.user_data["state"] = None
 
-        token = data.get("token") or data.get("result", {}).get("token") or data.get("auth_token")
-
-        if token or cookie_str:
-            if token:
-                AUTH_TOKEN = token
-            if cookie_str:
-                CURRENT_COOKIE = cookie_str
-            else:
-                CURRENT_COOKIE = f"auth-token={AUTH_TOKEN}; platform=web;"
-
-            context.user_data["state"] = None
+        if success:
             await status_msg.edit_text(
                 "✅ **Login Successful!**\n\n"
-                "Your authentication session is active. Send any **Show ID** or **Pocket FM URL** to fetch episodes.",
+                "Session cookies and token retrieved. Send a Show ID or Link to download episodes.",
                 parse_mode="Markdown"
             )
         else:
-            await status_msg.edit_text("❌ **Invalid OTP.** Please try logging in again via /start.")
-            context.user_data["state"] = None
+            await status_msg.edit_text("❌ Login failed. Try again using /start.")
         return
 
-    # 3. Manual Cookie State
+    # Step 3: Handle Manual Cookie Entry
     if user_state == "AWAITING_COOKIE" or text.startswith("eyJ") or "auth-token=" in text:
         CURRENT_COOKIE = text
-        token_match = re.search(r'auth-token=([^;]+)', text)
-        if token_match:
-            AUTH_TOKEN = token_match.group(1)
-        elif text.startswith("eyJ"):
-            AUTH_TOKEN = text
-
         context.user_data["state"] = None
-        await update.message.reply_text("✅ Session updated! Send a Show ID or URL to proceed.")
+        await update.message.reply_text("✅ Cookie/Token updated! Send a Show ID or Link to proceed.")
         return
 
-    # 4. Fetch Show ID or URL
+    # Step 4: Handle Show ID / Fetching Episodes
     show_id = extract_show_id(text)
     status_msg = await update.message.reply_text(f"🔍 Fetching episodes for Show ID: `{show_id}`...", parse_mode="Markdown")
 
     episodes = await fetch_show_episodes(show_id)
 
     if not episodes:
-        keyboard = [[InlineKeyboardButton("📱 Login via Mobile OTP", callback_data="btn_login_mobile")]]
+        keyboard = [[InlineKeyboardButton("🌐 Web Login", callback_data="btn_web_login")]]
         await status_msg.edit_text(
             "❌ **Could not fetch episodes.**\n\n"
-            "Your session token may be missing or expired. Click below to log in.",
+            "Session token may be missing or expired. Click below to log in.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -322,12 +365,12 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             await status_msg.edit_text(f"⏳ Downloading ({idx}/{len(episodes)}): **{ep_title}**...", parse_mode="Markdown")
-            
+
             downloaded = await download_file(stream_url, file_path)
 
             if downloaded and file_path.exists():
                 await status_msg.edit_text(f"📤 Uploading ({idx}/{len(episodes)}): **{ep_title}**...", parse_mode="Markdown")
-                
+
                 with open(file_path, "rb") as video_file:
                     await context.bot.send_video(
                         chat_id=TARGET_CHANNEL_ID,
