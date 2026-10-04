@@ -1,16 +1,18 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-# Install system-level ffmpeg
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install system dependencies including ffmpeg
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg wget ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy dependency list and install
+# Install Python requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# Copy bot application code
 COPY . .
 
 # Run the bot
-CMD ["python", "bot_runner.py"]
+CMD ["python", "bot.py"]
