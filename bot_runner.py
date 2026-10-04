@@ -8,9 +8,9 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8751864548:AAFhkXymbSEgyfT_F20L0u_WD1PzyA9bCR0")
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "-1004291729847")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8861377143"))
+BOT_TOKEN = (""8827979888:AAFdnb6pFvEuDva9-KKBjLx4fmeHt8H39Ek")
+LOG_CHANNEL_ID = ("-1004291729847")
+ADMIN_ID = ("8861377143"))
 # =======================================================
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
