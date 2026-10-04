@@ -1,298 +1,175 @@
-import os
 import re
-import sys
-import asyncio
 import logging
+import asyncio
 import subprocess
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import unquote
+from pathlib import Path
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
-    filters,
     ContextTypes,
+    filters,
 )
 
-# ==================== CONFIGURATION ====================
+# Logging Setup
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# CONFIGURATION (Hardcoded Credentials)
 BOT_TOKEN = "8827979888:AAGXJJsYhKHcVEGK-aCgJH0RqQxVtJb8Us8"
-# Converted to integer for telegram-bot API accuracy
-LOG_CHANNEL_ID = -1004291729847
-ADMIN_ID = 8861377143
-# =======================================================
+TARGET_CHANNEL_ID = "-1004291729847"
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# Your extracted auth-token
+AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yeSI6ImFjY2VzcyIsImRldmljZV9pZCI6Im1vYmlsZS13ZWIiLCJleHBpcnkiOjE3OTEyNTAxMzYsImlhdCI6MTc9MTA3NzMzNiwibG9jYWxlIjoiIiwicGxhdGZvcm0iOiJ3ZWIiLCJyb2xlIjoiTGlzdGVuZXIiLCJ0ZW5hbnQiOiJwb2NrZXRfZm0iLCJ1aWQiOiIiLCJ2ZXJzaW9uIjoidjIifQ.esfnEEDVJFaVzhW7qMZV3YOiE-ATSot2P4TunXuwMvA"
 
-download_queue = asyncio.Queue()
+DOWNLOAD_DIR = Path("./downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+# Headers with direct Auth Token Injection
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11; SM-A505F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Referer": "https://pocketfm.com/",
+    "Origin": "https://pocketfm.com",
+    "Cookie": f"auth-token={AUTH_TOKEN}",
+    "Authorization": f"Bearer {AUTH_TOKEN}",
+    "auth-token": AUTH_TOKEN
+}
 
-def start_dummy_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), DummyHandler)
-    server.serve_forever()
 
-def extract_stream_url(raw_text: str) -> str:
-    m3u8_match = re.search(
-        r'(https?%3A%2F%2F[^\s&]+\.(?:m3u8|mp4|jpg|jpeg|png|webp)|https?://[^\s&]+\.(?:m3u8|mp4|jpg|jpeg|png|webp))',
-        raw_text, re.IGNORECASE
-    )
-    if m3u8_match:
-        return unquote(m3u8_match.group(1))
-    return raw_text.strip()
+def extract_show_id(text: str) -> str:
+    """Extracts a 32-character show_id from a raw ID or Pocket FM URL."""
+    match = re.search(r'([a-f0-9]{32,40})', text, re.IGNORECASE)
+    return match.group(1) if match else text.strip()
 
-def parse_show_details(raw_text: str) -> tuple[str, str]:
-    decoded = unquote(raw_text)
-    show_name = ""
-    ep_num = ""
 
-    dt_match = re.search(r'[?&]dt=([^&]+)', raw_text)
-    if dt_match:
-        dt_val = unquote(dt_match.group(1))
-        ep_m = re.search(r'(?:ep|episode)\s*(\d+)', dt_val, re.IGNORECASE)
-        if ep_m:
-            ep_num = f"ep{ep_m.group(1)}"
+async def fetch_show_episodes(show_id: str) -> list:
+    """Queries Pocket FM API to fetch all episodes for a show."""
+    url = f"https://api.pocketfm.com/v2/content_api/show.get_details?show_id={show_id}&info_level=max"
+    
+    async with httpx.AsyncClient(headers=HEADERS, timeout=15.0) as client:
+        response = await client.get(url)
+        if response.status_code != 200:
+            logger.error(f"API Error {response.status_code}: {response.text}")
+            return []
+        
+        data = response.json()
+        episodes = []
+        stories = data.get("result", {}).get("stories", []) or data.get("show", {}).get("stories", [])
+        
+        for ep in stories:
+            ep_id = ep.get("id") or ep.get("story_id")
+            title = ep.get("title") or ep.get("name") or f"Episode {ep_id}"
+            stream_url = ep.get("media_url") or ep.get("stream_url") or ep.get("download_url")
+            
+            if ep_id:
+                episodes.append({
+                    "id": ep_id,
+                    "title": title,
+                    "stream_url": stream_url
+                })
+        return episodes
 
-        parts = [p.strip() for p in dt_val.split('-') if p.strip()]
-        if len(parts) >= 2:
-            show_name = parts[-1]
-        elif '|' in dt_val:
-            show_name = dt_val.split('|')[-1].strip()
 
-    if not ep_num:
-        st_match = re.search(r'[?&]up\.story_title=([^&]+)', raw_text)
-        if st_match:
-            st_val = unquote(st_match.group(1))
-            ep_m = re.search(r'(?:ep|episode)\s*(\d+)', st_val, re.IGNORECASE)
-            if ep_m:
-                ep_num = f"ep{ep_m.group(1)}"
-
-    if not show_name:
-        show_name = "super-yoddha"
-    if not ep_num:
-        ep_num = "ep"
-
-    clean_show = re.sub(r'[^a-zA-Z0-9\s]', '', show_name).strip()
-    formatted_show = re.sub(r'\s+', '-', clean_show).lower()
-    slug = f"{formatted_show}-{ep_num}"
-    display_name = f"{clean_show.title()} {ep_num.upper()}"
-
-    return display_name, slug
-
-# ==================== ADMIN PANEL ====================
-
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton("🔄 Update & Restart", callback_data="update_code"),
-            InlineKeyboardButton("ℹ️ Check Status", callback_data="check_status")
-        ],
-        [
-            InlineKeyboardButton("🧹 Clear Temp Cache", callback_data="clear_cache")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "⚙️ **Admin Control Panel**",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-        return
-
-    if query.data == "update_code":
-        await query.edit_message_text("🔄 **Restarting Bot...**")
-        try:
-            subprocess.run(["git", "pull"], check=True)
-        except Exception:
-            pass
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    elif query.data == "check_status":
-        queue_size = download_queue.qsize()
-        await query.edit_message_text(
-            f"📊 **Bot Status**\n\n"
-            f"🔹 **Queue:** `{queue_size}` remaining\n"
-            f"🔹 **Target Channel:** `{LOG_CHANNEL_ID}`"
-        )
-
-    elif query.data == "clear_cache":
-        count = 0
-        for f in os.listdir("/tmp"):
-            if f.endswith((".m4a", ".mp4", ".jpg", ".png", ".webp")):
-                os.remove(os.path.join("/tmp", f))
-                count += 1
-        await query.edit_message_text(f"🧹 **Cache Cleared:** Removed {count} file(s).")
-
-# ==================== DOWNLOAD WORKER ====================
-
-async def process_queue_worker(app: Application):
-    while True:
-        task = await download_queue.get()
-        url, force_video, update = task
-        try:
-            await execute_download(url, force_video, update, app)
-        except Exception as e:
-            logging.error(f"Execution Error: {e}")
-        finally:
-            download_queue.task_done()
-
-async def execute_download(url: str, force_video: bool, update: Update, app: Application):
-    stream_url = extract_stream_url(url)
-    display_title, file_slug = parse_show_details(url)
-    clean_url = stream_url.split('?')[0].lower()
-    remaining = download_queue.qsize()
-
-    # 1. IMAGE HANDLING
-    if any(clean_url.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
-        status_msg = await update.message.reply_text(f"⚡ **Downloading Image:** `{display_title}`...")
-        try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-                resp = await client.get(stream_url)
-                if resp.status_code == 200:
-                    img_path = f"/tmp/{file_slug}.jpg"
-                    with open(img_path, "wb") as f: f.write(resp.content)
-                    
-                    with open(img_path, "rb") as photo:
-                        await app.bot.send_photo(
-                            chat_id=LOG_CHANNEL_ID,
-                            photo=photo,
-                            caption=f"🖼 **{display_title}**\n\n🔗 `{stream_url}`"
-                        )
-                    await status_msg.edit_text(f"🚀 **{display_title}** image uploaded to channel!")
-                    if os.path.exists(img_path): os.remove(img_path)
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Upload Error to Channel: `{str(e)}`")
-        return
-
-    # 2. MEDIA EXTRACTION
-    is_video = force_video or ('video' in clean_url or clean_url.endswith('.mp4'))
-    ext = "mp4" if is_video else "m4a"
-    output_path = f"/tmp/{file_slug}.{ext}"
-
-    status_msg = await update.message.reply_text(
-        f"⚡ **Downloading {ext.upper()}:** `{display_title}`\n⏳ Queue remaining: `{remaining}`..."
-    )
-
-    if os.path.exists(output_path):
-        os.remove(output_path)
-
+async def download_file(url: str, output_path: Path) -> bool:
+    """Downloads audio/video fragment via multi-threaded yt-dlp."""
     cmd = [
         "yt-dlp",
-        "--no-playlist",
         "--concurrent-fragments", "16",
-        "--add-header", "User-Agent: Mozilla/5.0 (Linux; Android 10; Mobile)",
-        "--add-header", "Origin: https://pocketfm.com",
-        "--add-header", "Referer: https://pocketfm.com/",
-        "-o", output_path,
-        stream_url
+        "--add-header", f"Cookie: auth-token={AUTH_TOKEN}",
+        "--add-header", f"Authorization: Bearer {AUTH_TOKEN}",
+        "--user-agent", HEADERS["User-Agent"],
+        "--referer", HEADERS["Referer"],
+        "-o", str(output_path),
+        url
     ]
 
-    if is_video:
-        cmd.extend(["--recode-video", "mp4"])
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        _, stderr = await process.communicate()
-
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
-            file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            await status_msg.edit_text(f"⚡ Downloaded ({file_size_mb:.2f} MB).\n📤 Uploading `{file_slug}.{ext}` to Channel...")
-
-            try:
-                with open(output_path, "rb") as media_file:
-                    if is_video:
-                        await app.bot.send_video(
-                            chat_id=LOG_CHANNEL_ID,
-                            video=media_file,
-                            filename=f"{file_slug}.mp4",
-                            caption=f"🎬 **{display_title} (Video)**\n📁 File: `{file_slug}.mp4`"
-                        )
-                    else:
-                        await app.bot.send_audio(
-                            chat_id=LOG_CHANNEL_ID,
-                            audio=media_file,
-                            filename=f"{file_slug}.m4a",
-                            title=display_title,
-                            performer="Pocket FM Bot",
-                            caption=f"🎉 **{display_title}**\n📁 File: `{file_slug}.m4a`"
-                        )
-                await status_msg.edit_text(f"🚀 **{display_title}** ({ext.upper()}) uploaded to channel successfully!")
-            except Exception as upload_err:
-                await status_msg.edit_text(f"❌ **Channel Upload Failed:** `{str(upload_err)}`\n\nMake sure the bot is an **Admin** in channel ID `{LOG_CHANNEL_ID}` with posting permissions.")
-
-            if os.path.exists(output_path): os.remove(output_path)
-        else:
-            err_log = stderr.decode()[-250:] if stderr else "Download error"
-            await status_msg.edit_text(f"❌ **Error:** `{err_log}`")
-
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Execution Error: {str(e)}")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text(
-        "⚡ **High-Speed Downloader Ready!**\n\n"
-        "• Paste any Pocket FM link directly for Audio\n"
-        "• Type `/video <link>` to download Video (`.mp4`)"
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
     )
-
-async def handle_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    _, stderr = await proc.communicate()
     
-    if context.args:
-        url = context.args[0]
-        await download_queue.put((url, True, update))
-        await update.message.reply_text("📥 Added 1 **Video** task to queue!")
-    else:
-        await update.message.reply_text("⚠️ Please provide a link: `/video <link>`")
+    if proc.returncode == 0:
+        return True
+    logger.error(f"yt-dlp error: {stderr.decode()}")
+    return False
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
 
-    if update.message.text:
-        text = update.message.text.strip()
-        urls = re.findall(r'https?://[^\s]+', text)
-        if urls:
-            for url in urls:
-                await download_queue.put((url, False, update))
-            await update.message.reply_text(f"📥 Added {len(urls)} item(s) to queue!")
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 **Pocket FM Master Extractor Bot**\n\n"
+        "Send me any **Show ID** or **Pocket FM Show URL**.\n"
+        "I will fetch all episodes and upload them directly to your channel."
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def handle_show_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    input_text = update.message.text.strip()
+    show_id = extract_show_id(input_text)
+    
+    status_msg = await update.message.reply_text(f"🔍 Fetching episodes for Show ID: `{show_id}`...", parse_mode="Markdown")
+
+    episodes = await fetch_show_episodes(show_id)
+
+    if not episodes:
+        await status_msg.edit_text("❌ Could not fetch episodes. Verify the Show ID or check if your `auth-token` has expired.")
+        return
+
+    await status_msg.edit_text(f"📦 Found **{len(episodes)}** episodes! Starting sequential download & upload...", parse_mode="Markdown")
+
+    success_count = 0
+    for idx, ep in enumerate(episodes, start=1):
+        ep_id = ep["id"]
+        ep_title = ep["title"]
+        stream_url = ep.get("stream_url") or f"https://pocketfm.com/episode/{ep_id}"
+
+        file_path = DOWNLOAD_DIR / f"{show_id}_{ep_id}.mp4"
+
+        try:
+            await status_msg.edit_text(f"⏳ Downloading ({idx}/{len(episodes)}): **{ep_title}**...", parse_mode="Markdown")
+            
+            downloaded = await download_file(stream_url, file_path)
+
+            if downloaded and file_path.exists():
+                await status_msg.edit_text(f"📤 Uploading ({idx}/{len(episodes)}): **{ep_title}** to channel...", parse_mode="Markdown")
+                
+                with open(file_path, "rb") as video_file:
+                    await context.bot.send_video(
+                        chat_id=TARGET_CHANNEL_ID,
+                        video=video_file,
+                        caption=f"🎧 **{ep_title}**\n🆔 Episode ID: `{ep_id}`\n📺 Show ID: `{show_id}`",
+                        parse_mode="Markdown"
+                    )
+                success_count += 1
+            else:
+                logger.warning(f"Failed to download episode {ep_id}")
+
+        except Exception as e:
+            logger.error(f"Error processing episode {ep_id}: {e}")
+
+        finally:
+            if file_path.exists():
+                file_path.unlink()
+
+    await status_msg.edit_text(f"🎉 Process Complete! Uploaded **{success_count}/{len(episodes)}** episodes to your channel.")
+
 
 def main():
-    threading.Thread(target=start_dummy_server, daemon=True).start()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("video", handle_video_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_show_request))
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(process_queue_worker(app))
-
-    print("🤖 Downloader Active...")
+    logger.info("Bot is starting...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
