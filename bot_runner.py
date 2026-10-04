@@ -19,7 +19,7 @@ from telegram.ext import (
 )
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "PASTE_YOUR_NEW_BOT_TOKEN_HERE"
+BOT_TOKEN = "8827979888:AAGXJJsYhKHcVEGK-aCgJH0RqQxVtJb8Us8"
 LOG_CHANNEL_ID = "-1004291729847"
 ADMIN_ID = 8861377143
 # =======================================================
