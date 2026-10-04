@@ -3,19 +3,33 @@ import re
 import asyncio
 import logging
 import subprocess
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = ("8827979888:AAGXJJsYhKHcVEGK-aCgJH0RqQxVtJb8Us8")
-LOG_CHANNEL_ID = ("-1004291729847")
-ADMIN_ID = ("8861377143")
+BOT_TOKEN = "8827979888:AAGXJJsYhKHcVEGK-aCgJH0RqQxVtJb8Us8"
+LOG_CHANNEL_ID = "-1004291729847"
+ADMIN_ID = 8861377143
 # =======================================================
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-FFMPEG_EXE = "ffmpeg"  # Natively available in Docker container
+FFMPEG_EXE = "ffmpeg"  # Natively available in the Docker container on Render
+
+# Dummy HTTP server to satisfy Render's Web Service port scan
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), DummyHandler)
+    server.serve_forever()
 
 def extract_stream_url(raw_text: str) -> str:
     m3u8_match = re.search(r'(https?%3A%2F%2F[^\s&]+\.m3u8|https?://[^\s&]+\.m3u8)', raw_text)
@@ -26,7 +40,7 @@ def extract_stream_url(raw_text: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text("👋 **Pocket FM Bot Ready!**\nSend any audio stream link to download.")
+    await update.message.reply_text("👋 **Pocket FM Bot Ready!**\nSend any audio stream link or analytics URL to download.")
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -34,7 +48,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = update.message.text.strip()
     if not ("http://" in user_text or "https://" in user_text):
-        await update.message.reply_text("⚠️ Send a valid link starting with http:// or https://")
+        await update.message.reply_text("⚠️ Please send a valid HTTP/HTTPS link.")
         return
 
     stream_url = extract_stream_url(user_text)
@@ -89,6 +103,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ **Execution Error:** {str(e)}")
 
 def main():
+    # Start dummy web server in background to fix Render port scan warning
+    threading.Thread(target=start_dummy_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
