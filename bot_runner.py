@@ -20,17 +20,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# CONFIGURATION (Hardcoded Credentials)
+# Hardcoded Credentials
 BOT_TOKEN = "8827979888:AAGXJJsYhKHcVEGK-aCgJH0RqQxVtJb8Us8"
 TARGET_CHANNEL_ID = "-1004291729847"
 
-# Your extracted auth-token
+# Extracted auth-token
 AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yeSI6ImFjY2VzcyIsImRldmljZV9pZCI6Im1vYmlsZS13ZWIiLCJleHBpcnkiOjE3OTEyNTAxMzYsImlhdCI6MTc9MTA3NzMzNiwibG9jYWxlIjoiIiwicGxhdGZvcm0iOiJ3ZWIiLCJyb2xlIjoiTGlzdGVuZXIiLCJ0ZW5hbnQiOiJwb2NrZXRfZm0iLCJ1aWQiOiIiLCJ2ZXJzaW9uIjoidjIifQ.esfnEEDVJFaVzhW7qMZV3YOiE-ATSot2P4TunXuwMvA"
 
 DOWNLOAD_DIR = Path("./downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Headers with direct Auth Token Injection
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 11; SM-A505F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
     "Referer": "https://pocketfm.com/",
@@ -48,7 +47,7 @@ def extract_show_id(text: str) -> str:
 
 
 async def fetch_show_episodes(show_id: str) -> list:
-    """Queries Pocket FM API to fetch all episodes for a show."""
+    """Queries Pocket FM API using auth-token to fetch all episodes for a show."""
     url = f"https://api.pocketfm.com/v2/content_api/show.get_details?show_id={show_id}&info_level=max"
     
     async with httpx.AsyncClient(headers=HEADERS, timeout=15.0) as client:
@@ -76,7 +75,7 @@ async def fetch_show_episodes(show_id: str) -> list:
 
 
 async def download_file(url: str, output_path: Path) -> bool:
-    """Downloads audio/video fragment via multi-threaded yt-dlp."""
+    """Downloads stream fragment via multi-threaded yt-dlp."""
     cmd = [
         "yt-dlp",
         "--concurrent-fragments", "16",
@@ -119,7 +118,7 @@ async def handle_show_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     episodes = await fetch_show_episodes(show_id)
 
     if not episodes:
-        await status_msg.edit_text("❌ Could not fetch episodes. Verify the Show ID or check if your `auth-token` has expired.")
+        await status_msg.edit_text("❌ Could not fetch episodes. Check if Show ID is valid or if `auth-token` has expired.")
         return
 
     await status_msg.edit_text(f"📦 Found **{len(episodes)}** episodes! Starting sequential download & upload...", parse_mode="Markdown")
@@ -167,7 +166,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_show_request))
 
-    logger.info("Bot is starting...")
+    logger.info("Bot starting up...")
     app.run_polling()
 
 
