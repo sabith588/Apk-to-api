@@ -24,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # CONFIGURATION
-BOT_TOKEN = "8827979888:AAGXJJsYhKHcVEGK-aCgJH0RqQxVtJb8Us8"
+BOT_TOKEN = "8827979888:AAGuR6pRAqJqaSImzmQU_t_Rd077u7JyaKM"
 TARGET_CHANNEL_ID = "-1004291729847"
 
 # Session Storage
