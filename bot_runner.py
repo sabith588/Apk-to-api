@@ -1,4 +1,3 @@
-
 import os
 import re
 import sys
@@ -27,7 +26,6 @@ ADMIN_ID = 8861377143
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-FFMPEG_EXE = "ffmpeg"
 download_queue = asyncio.Queue()
 
 class DummyHandler(BaseHTTPRequestHandler):
@@ -42,6 +40,7 @@ def start_dummy_server():
     server.serve_forever()
 
 def extract_stream_url(raw_text: str) -> str:
+    # Extracts .m3u8 or .mp4 links out of nested Google Analytics parameters
     m3u8_match = re.search(
         r'(https?%3A%2F%2F[^\s&]+\.(?:m3u8|mp4|jpg|jpeg|png|webp)|https?://[^\s&]+\.(?:m3u8|mp4|jpg|jpeg|png|webp))',
         raw_text, re.IGNORECASE
@@ -78,20 +77,18 @@ def parse_show_details(raw_text: str) -> tuple[str, str]:
                 ep_num = f"ep{ep_m.group(1)}"
 
     if not show_name:
-        show_name = "pocketfm"
+        show_name = "super-yoddha"
     if not ep_num:
         ep_num = "ep"
 
     clean_show = re.sub(r'[^a-zA-Z0-9\s]', '', show_name).strip()
-    
-    # FIXED: Replaced backslash expression outside f-string to prevent deployment SyntaxError
     formatted_show = re.sub(r'\s+', '-', clean_show).lower()
     slug = f"{formatted_show}-{ep_num}"
     display_name = f"{clean_show.title()} {ep_num.upper()}"
 
     return display_name, slug
 
-# ==================== ADMIN CONTROL PANEL ====================
+# ==================== ADMIN PANEL ====================
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -122,7 +119,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "update_code":
-        await query.edit_message_text("🔄 **Updating Code & Restarting...**\nPlease wait a few seconds.")
+        await query.edit_message_text("🔄 **Updating Code & Restarting...**\nPlease wait standard deployment time.")
         try:
             subprocess.run(["git", "pull"], check=True)
         except Exception:
@@ -132,10 +129,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "check_status":
         queue_size = download_queue.qsize()
         await query.edit_message_text(
-            f"📊 **Bot Operational Status**\n\n"
-            f"🔹 **Active Queue:** `{queue_size}` task(s)\n"
-            f"🔹 **Target Log Channel:** `{LOG_CHANNEL_ID}`\n"
-            f"🔹 **Engine:** Multi-threaded FFmpeg Direct Copy"
+            f"📊 **Bot Status**\n\n"
+            f"🔹 **Queue:** `{queue_size}` remaining\n"
+            f"🔹 **Engine:** Ultra-Fast yt-dlp Multi-Threading\n"
+            f"🔹 **Channel:** `{LOG_CHANNEL_ID}`"
         )
 
     elif query.data == "clear_cache":
@@ -144,9 +141,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if f.endswith((".m4a", ".mp4", ".jpg", ".png", ".webp")):
                 os.remove(os.path.join("/tmp", f))
                 count += 1
-        await query.edit_message_text(f"🧹 **Cache Cleared:** Removed {count} temporary file(s).")
+        await query.edit_message_text(f"🧹 **Cache Cleared:** Removed {count} file(s).")
 
-# ==================== DOWNLOAD QUEUE WORKER ====================
+# ==================== DOWNLOAD WORKER ====================
 
 async def process_queue_worker(app: Application):
     while True:
@@ -165,12 +162,9 @@ async def execute_download(url: str, update: Update, app: Application):
     clean_url = stream_url.split('?')[0].lower()
     remaining = download_queue.qsize()
 
-    status_msg = await update.message.reply_text(
-        f"⚡ **Fast Extracting:** `{display_title}`\n⏳ Queue remaining: `{remaining}` item(s)..."
-    )
-
     # 1. PHOTO/IMAGE HANDLING
     if any(clean_url.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+        status_msg = await update.message.reply_text(f"⚡ **Downloading Image:** `{display_title}`...")
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
                 resp = await client.get(stream_url)
@@ -184,29 +178,34 @@ async def execute_download(url: str, update: Update, app: Application):
                             photo=photo,
                             caption=f"🖼 **{display_title}**\n\n🔗 `{stream_url}`"
                         )
-                    await status_msg.edit_text(f"🚀 **{display_title}** uploaded to Log Channel!")
+                    await status_msg.edit_text(f"🚀 **{display_title}** image uploaded!")
                     if os.path.exists(img_path): os.remove(img_path)
         except Exception as e:
-            await status_msg.edit_text(f"❌ Error downloading image: {str(e)}")
+            await status_msg.edit_text(f"❌ Image Error: {str(e)}")
         return
 
-    # 2. AUDIO HLS STREAM (Zero-Encoding Fast Copy)
-    output_file = f"/tmp/{file_slug}.m4a"
-    if os.path.exists(output_file): os.remove(output_file)
+    # 2. AUDIO / VIDEO HIGH-SPEED EXTRACTOR USING YT-DLP
+    is_video = 'video' in clean_url or clean_url.endswith('.mp4')
+    ext = "mp4" if is_video else "m4a"
+    output_path = f"/tmp/{file_slug}.{ext}"
 
-    headers = (
-        "User-Agent: Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36\r\n"
-        "Origin: https://pocketfm.com\r\n"
-        "Referer: https://pocketfm.com/\r\n"
+    status_msg = await update.message.reply_text(
+        f"⚡ **Ultra-Fast Extracting ({ext.upper()}):** `{display_title}`\n⏳ Queue remaining: `{remaining}`..."
     )
 
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    # Multi-threaded download command (Concurrent 16 threads for maximum network speed)
     cmd = [
-        FFMPEG_EXE, "-y",
-        "-headers", headers,
-        "-i", stream_url,
-        "-c:a", "copy",
-        "-threads", "0",
-        output_file
+        "yt-dlp",
+        "--no-playlist",
+        "--concurrent-fragments", "16",
+        "--add-header", "User-Agent: Mozilla/5.0 (Linux; Android 10; Mobile)",
+        "--add-header", "Origin: https://pocketfm.com",
+        "--add-header", "Referer: https://pocketfm.com/",
+        "-o", output_path,
+        stream_url
     ]
 
     try:
@@ -215,31 +214,40 @@ async def execute_download(url: str, update: Update, app: Application):
         )
         _, stderr = await process.communicate()
 
-        if os.path.exists(output_file) and os.path.getsize(output_file) > 10000:
-            file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-            await status_msg.edit_text(f"⚡ Downloaded ({file_size_mb:.2f} MB).\n📤 Uploading `{file_slug}.m4a`...")
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
+            file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            await status_msg.edit_text(f"⚡ Downloaded ({file_size_mb:.2f} MB).\n📤 Uploading `{file_slug}.{ext}`...")
 
-            with open(output_file, "rb") as audio:
-                await app.bot.send_audio(
-                    chat_id=LOG_CHANNEL_ID,
-                    audio=audio,
-                    filename=f"{file_slug}.m4a",
-                    title=display_title,
-                    performer="Pocket FM Bot",
-                    caption=f"🎉 **{display_title}**\n📁 **File:** `{file_slug}.m4a`\n🔗 **Stream:** `{stream_url}`"
-                )
-            await status_msg.edit_text(f"🚀 **{display_title}** successfully auto-sorted and uploaded!")
-            if os.path.exists(output_file): os.remove(output_file)
+            with open(output_path, "rb") as media_file:
+                if is_video:
+                    await app.bot.send_video(
+                        chat_id=LOG_CHANNEL_ID,
+                        video=media_file,
+                        filename=f"{file_slug}.mp4",
+                        caption=f"🎬 **{display_title} (Video)**\n📁 File: `{file_slug}.mp4`"
+                    )
+                else:
+                    await app.bot.send_audio(
+                        chat_id=LOG_CHANNEL_ID,
+                        audio=media_file,
+                        filename=f"{file_slug}.m4a",
+                        title=display_title,
+                        performer="Pocket FM Bot",
+                        caption=f"🎉 **{display_title}**\n📁 File: `{file_slug}.m4a`"
+                    )
+
+            await status_msg.edit_text(f"🚀 **{display_title}** finished in seconds!")
+            if os.path.exists(output_path): os.remove(output_path)
         else:
-            err_log = stderr.decode()[-200:] if stderr else "Empty output file"
-            await status_msg.edit_text(f"❌ **FFmpeg Error:** `{err_log}`")
+            err_log = stderr.decode()[-250:] if stderr else "Download error"
+            await status_msg.edit_text(f"❌ **yt-dlp Error:** `{err_log}`")
 
     except Exception as e:
         await status_msg.edit_text(f"❌ Execution Error: {str(e)}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("⚡ **Automated Downloader Active!**\nUse /admin to open control panel.")
+    await update.message.reply_text("⚡ **High-Speed Downloader Ready!**\nSend stream links or use /admin.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -250,13 +258,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if urls:
             for url in urls:
                 await download_queue.put((url, update))
-            await update.message.reply_text(f"📥 Added {len(urls)} item(s) to the processing queue!")
+            await update.message.reply_text(f"📥 Added {len(urls)} item(s) to queue!")
 
 def main():
     threading.Thread(target=start_dummy_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -265,7 +273,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(process_queue_worker(app))
 
-    print("🤖 High-Speed Media Downloader Bot Active...")
+    print("🤖 Ultra-Fast yt-dlp Downloader Bot Active...")
     app.run_polling()
 
 if __name__ == "__main__":
